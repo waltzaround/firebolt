@@ -55,6 +55,7 @@ type DbConnection = moduleBindings.DbConnection;
 type EventContext = moduleBindings.EventContext;
 type ErrorContext = moduleBindings.ErrorContext;
 type PlayerData = moduleBindings.PlayerData;
+type ProjectileData = moduleBindings.ProjectileData;
 type InputState = moduleBindings.InputState;
 // ... other types ...
 
@@ -65,6 +66,7 @@ function App() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [statusMessage, setStatusMessage] = useState("Connecting...");
   const [players, setPlayers] = useState<ReadonlyMap<string, PlayerData>>(new Map());
+  const [projectiles, setProjectiles] = useState<ReadonlyMap<number, ProjectileData>>(new Map());
   const [localPlayer, setLocalPlayer] = useState<PlayerData | null>(null);
   const [showJoinDialog, setShowJoinDialog] = useState(false);
   const [isDebugPanelExpanded, setIsDebugPanelExpanded] = useState(false);
@@ -90,7 +92,10 @@ function App() {
     conn.db.player.onInsert((_ctx: EventContext, player: PlayerData) => {
         console.log("Player inserted (callback):", player.identity.toHexString());
         setPlayers((prev: ReadonlyMap<string, PlayerData>) => new Map(prev).set(player.identity.toHexString(), player));
-        if (identity && player.identity.toHexString() === identity.toHexString()) {
+        // Use conn.identity directly to avoid race condition with React state
+        const currentIdentity = conn.identity;
+        if (currentIdentity && player.identity.toHexString() === currentIdentity.toHexString()) {
+            console.log("Setting localPlayer from insert:", player.username);
             setLocalPlayer(player);
             setStatusMessage(`Registered as ${player.username}`);
         }
@@ -102,7 +107,9 @@ function App() {
             newMap.set(newPlayer.identity.toHexString(), newPlayer);
             return newMap;
         });
-        if (identity && newPlayer.identity.toHexString() === identity.toHexString()) {
+        // Use conn.identity directly to avoid race condition with React state
+        const currentIdentity = conn.identity;
+        if (currentIdentity && newPlayer.identity.toHexString() === currentIdentity.toHexString()) {
             setLocalPlayer(newPlayer);
         }
     });
@@ -114,11 +121,49 @@ function App() {
             newMap.delete(player.identity.toHexString());
             return newMap;
         });
-        if (identity && player.identity.toHexString() === identity.toHexString()) {
+        // Use conn.identity directly to avoid race condition with React state
+        const currentIdentity = conn.identity;
+        if (currentIdentity && player.identity.toHexString() === currentIdentity.toHexString()) {
             setLocalPlayer(null);
             setStatusMessage("Local player deleted!");
         }
     });
+
+    // Projectile table callbacks
+    conn.db.projectile.onInsert((_ctx: EventContext, projectile: ProjectileData) => {
+        console.log("🔥 Projectile inserted:", projectile.id);
+        console.log("🔍 Full projectile object:", projectile);
+        console.log("🔍 Projectile fields:");
+        console.log("  - id:", projectile.id);
+        console.log("  - caster_identity:", projectile.caster_identity);
+        console.log("  - target_identity:", projectile.target_identity);
+        console.log("  - position:", projectile.position);
+        console.log("  - speed:", projectile.speed);
+        console.log("  - projectile_type:", projectile.projectile_type);
+        setProjectiles((prev: ReadonlyMap<number, ProjectileData>) => {
+            const newMap = new Map(prev).set(projectile.id, projectile);
+            console.log("🔥 Updated projectiles map size:", newMap.size);
+            return newMap;
+        });
+    });
+
+    conn.db.projectile.onUpdate((_ctx: EventContext, _oldProjectile: ProjectileData, newProjectile: ProjectileData) => {
+        setProjectiles((prev: ReadonlyMap<number, ProjectileData>) => {
+            const newMap = new Map(prev);
+            newMap.set(newProjectile.id, newProjectile);
+            return newMap;
+        });
+    });
+
+    conn.db.projectile.onDelete((_ctx: EventContext, projectile: ProjectileData) => {
+        console.log("Projectile deleted:", projectile.id);
+        setProjectiles((prev: ReadonlyMap<number, ProjectileData>) => {
+            const newMap = new Map(prev);
+            newMap.delete(projectile.id);
+            return newMap;
+        });
+    });
+
     console.log("Table callbacks registered.");
   }, [identity]); // Keep identity dependency
 
@@ -127,17 +172,22 @@ function App() {
      setPlayers((prev: ReadonlyMap<string, PlayerData>) => {
          if (prev.size === 0 && conn) {
              const currentPlayers = new Map<string, PlayerData>();
+             // Use conn.identity directly to avoid race condition with React state
+             const currentIdentity = conn.identity;
+      
              for (const player of conn.db.player.iter()) {
                  currentPlayers.set(player.identity.toHexString(), player);
-                 if (identity && player.identity.toHexString() === identity.toHexString()) {
+                 if (currentIdentity && player.identity.toHexString() === currentIdentity.toHexString()) {
+                     console.log("Setting localPlayer from subscription:", player.username);
                      setLocalPlayer(player);
                  }
              }
+          
              return currentPlayers;
          }
          return prev;
      });
-  }, [identity]); // Keep identity dependency
+  }, []); // Remove identity dependency since we use conn.identity directly
 
   const onSubscriptionError = useCallback((error: any) => {
       console.error("Subscription error:", error);
@@ -149,6 +199,7 @@ function App() {
     console.log("Subscribing to tables...");
     const subscription = conn.subscriptionBuilder();
     subscription.subscribe("SELECT * FROM player");
+    subscription.subscribe("SELECT * FROM projectile");
     subscription.onApplied(onSubscriptionApplied);
     subscription.onError(onSubscriptionError);
   }, [identity, onSubscriptionApplied, onSubscriptionError]); // Add dependencies
@@ -248,7 +299,14 @@ function App() {
   }, []);
 
   const handleKeyDown = useCallback((event: KeyboardEvent) => {
-      if (event.repeat) return; 
+      if (event.repeat) return;
+      
+      // Don't handle movement keys if user is typing in an input field
+      const target = event.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.contentEditable === 'true') {
+        return;
+      }
+      
       const action = keyMap[event.code];
       if (action) {
           if (!currentInputRef.current[action]) { 
@@ -258,6 +316,12 @@ function App() {
   }, []);
 
   const handleKeyUp = useCallback((event: KeyboardEvent) => {
+      // Don't handle movement keys if user is typing in an input field
+      const target = event.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.contentEditable === 'true') {
+        return;
+      }
+      
       const action = keyMap[event.code];
       if (action) {
           if (currentInputRef.current[action]) { 
@@ -350,13 +414,13 @@ function App() {
       };
 
       if (connected && !animationFrameIdRef.current) {
-          console.log("[CLIENT] Starting game loop.");
+        //  console.log("[CLIENT] Starting game loop.");
           animationFrameIdRef.current = requestAnimationFrame(gameLoop);
       }
 
       return () => {
           if (animationFrameIdRef.current) {
-              console.log("[CLIENT] Stopping game loop.");
+            //  console.log("[CLIENT] Stopping game loop.");
               cancelAnimationFrame(animationFrameIdRef.current);
               animationFrameIdRef.current = null;
           }
@@ -375,7 +439,10 @@ function App() {
         return;
     }
 
-    const dbHost = "localhost:3000";
+    // Use window.location.hostname to automatically use the same host as the client
+    // This allows friends on local network to connect when you run with --host
+    const dbHost = `${window.location.hostname}:3000`;
+    console.log("🌐 Connecting to SpacetimeDB at:", dbHost);
     const dbName = "vibe-multiplayer";
 
     console.log(`Connecting to SpacetimeDB at ${dbHost}, database: ${dbName}...`);
@@ -451,15 +518,23 @@ function App() {
       {/* Always render GameScene and PlayerUI when connected */} 
       {connected && (
         <>
+        
           <GameScene 
             players={players} 
+            projectiles={projectiles}
             localPlayerIdentity={identity} 
             onPlayerRotation={handlePlayerRotation}
             currentInputRef={currentInputRef}
             isDebugPanelVisible={isDebugPanelExpanded}
           />
           {/* Render PlayerUI only if localPlayer exists */} 
-          {localPlayer && <PlayerUI playerData={localPlayer} />} 
+         
+          {localPlayer && <PlayerUI playerData={localPlayer} connection={conn} />}
+          {!localPlayer && connected && (
+            <div style={{position: 'fixed', top: '20px', left: '20px', color: 'white', background: 'rgba(0,0,0,0.7)', padding: '10px', borderRadius: '5px'}}>
+              Connected but no localPlayer data
+            </div>
+          )} 
         </>
       )}
 

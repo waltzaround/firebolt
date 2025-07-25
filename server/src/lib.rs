@@ -90,6 +90,21 @@ pub struct GameTickSchedule {
     scheduled_at: ScheduleAt,
 }
 
+#[spacetimedb::table(name = projectile, public)]
+#[derive(Clone)]
+pub struct ProjectileData {
+    #[primary_key]
+    #[auto_inc]
+    id: u64,
+    caster_identity: Identity,
+    position: Vector3,
+    target_identity: Identity,
+    speed: f32,
+    created_at: Timestamp,
+    expires_at: Timestamp,
+    projectile_type: String, // "homing_sphere", etc.
+}
+
 // --- Lifecycle Reducers ---
 
 #[spacetimedb::reducer(init)]
@@ -247,6 +262,85 @@ pub fn update_player_input(
     }
 }
 
+#[spacetimedb::reducer]
+pub fn cast_spell(
+    ctx: &ReducerContext,
+    spell_name: String,
+) {
+    let caster_identity = ctx.sender;
+    spacetimedb::log::info!("🔥 CAST_SPELL CALLED: {} casting {}", caster_identity, spell_name);
+    
+    // Find the caster
+    spacetimedb::log::info!("🔍 Looking for caster: {}", caster_identity);
+    if let Some(caster) = ctx.db.player().identity().find(caster_identity) {
+        spacetimedb::log::info!("✅ Found caster: {}", caster_identity);
+        
+        spacetimedb::log::info!("Player {} cast {}", caster_identity, spell_name);
+        
+        // Find nearest player (excluding caster)
+        let mut nearest_player: Option<PlayerData> = None;
+        let mut nearest_distance = f32::MAX;
+        
+        for player in ctx.db.player().iter() {
+            if player.identity != caster_identity {
+                let distance = calculate_distance(&caster.position, &player.position);
+                if distance < nearest_distance {
+                    nearest_distance = distance;
+                    nearest_player = Some(player.clone());
+                }
+            }
+        }
+        
+        let current_time = ctx.timestamp;
+        let expires_at = Timestamp::from_micros_since_unix_epoch(
+            current_time.to_micros_since_unix_epoch() + 5_000_000 // 5 seconds
+        );
+        
+        // Create homing sphere - if target found, target them; otherwise create a projectile that moves forward
+        if let Some(target) = nearest_player {
+            let projectile = ProjectileData {
+                id: 0, // auto_inc will set this
+                caster_identity,
+                position: caster.position.clone(),
+                target_identity: target.identity,
+                speed: 15.0, // units per second
+                created_at: current_time,
+                expires_at,
+                projectile_type: "homing_sphere".to_string(),
+            };
+            
+            ctx.db.projectile().insert(projectile);
+            spacetimedb::log::info!("Created homing sphere targeting player {}", target.identity);
+        } else {
+            // No other players found - create a projectile that targets a position in front of the caster
+            // For single-player testing, we'll target the caster themselves so the projectile is visible
+            let projectile = ProjectileData {
+                id: 0, // auto_inc will set this
+                caster_identity,
+                position: caster.position.clone(),
+                target_identity: caster_identity, // Target self for single-player testing
+                speed: 15.0, // units per second
+                created_at: current_time,
+                expires_at,
+                projectile_type: "homing_sphere".to_string(),
+            };
+            
+            ctx.db.projectile().insert(projectile);
+            spacetimedb::log::info!("Created homing sphere targeting self (single-player mode)");
+        }
+    } else {
+        spacetimedb::log::warn!("Player {} tried to cast spell but is not active.", caster_identity);
+    }
+}
+
+// Helper function to calculate distance between two points
+fn calculate_distance(pos1: &Vector3, pos2: &Vector3) -> f32 {
+    let dx = pos1.x - pos2.x;
+    let dy = pos1.y - pos2.y;
+    let dz = pos1.z - pos2.z;
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 #[spacetimedb::reducer(update)]
 pub fn game_tick(ctx: &ReducerContext, _tick_info: GameTickSchedule) {
     // Just use a simple log message without timestamp conversion
@@ -254,5 +348,78 @@ pub fn game_tick(ctx: &ReducerContext, _tick_info: GameTickSchedule) {
     
     player_logic::update_players_logic(ctx, delta_time);
     
+    // Update projectiles
+    update_projectiles(ctx, delta_time);
+    
     spacetimedb::log::debug!("Game tick completed");
+}
+
+// Update all projectiles - move them toward targets and handle expiration
+fn update_projectiles(ctx: &ReducerContext, delta_time: f64) {
+    let current_time = ctx.timestamp;
+    let mut projectiles_to_delete = Vec::new();
+    
+    for projectile in ctx.db.projectile().iter() {
+        // Check if projectile has expired
+        if current_time.to_micros_since_unix_epoch() >= projectile.expires_at.to_micros_since_unix_epoch() {
+            projectiles_to_delete.push(projectile.id);
+            spacetimedb::log::info!("Projectile {} expired", projectile.id);
+            continue;
+        }
+        
+        // Find the target player
+        if let Some(target) = ctx.db.player().identity().find(projectile.target_identity) {
+            // Calculate direction to target
+            let direction = Vector3 {
+                x: target.position.x - projectile.position.x,
+                y: target.position.y - projectile.position.y,
+                z: target.position.z - projectile.position.z,
+            };
+            
+            // Calculate distance to target
+            let distance = calculate_distance(&projectile.position, &target.position);
+            
+            // Check if projectile reached target (within 1 unit)
+            if distance <= 1.0 {
+                projectiles_to_delete.push(projectile.id);
+                spacetimedb::log::info!("Projectile {} hit target {}", projectile.id, target.identity);
+                
+                // TODO: Apply damage or effect to target here
+                // For now, just log the hit
+                continue;
+            }
+            
+            // Normalize direction vector
+            let magnitude = (direction.x * direction.x + direction.y * direction.y + direction.z * direction.z).sqrt();
+            if magnitude > 0.01 {
+                let normalized_direction = Vector3 {
+                    x: direction.x / magnitude,
+                    y: direction.y / magnitude,
+                    z: direction.z / magnitude,
+                };
+                
+                // Move projectile toward target
+                let movement_distance = projectile.speed * delta_time as f32;
+                let new_position = Vector3 {
+                    x: projectile.position.x + normalized_direction.x * movement_distance,
+                    y: projectile.position.y + normalized_direction.y * movement_distance,
+                    z: projectile.position.z + normalized_direction.z * movement_distance,
+                };
+                
+                // Update projectile position
+                let mut updated_projectile = projectile.clone();
+                updated_projectile.position = new_position;
+                ctx.db.projectile().id().update(updated_projectile);
+            }
+        } else {
+            // Target player no longer exists, remove projectile
+            projectiles_to_delete.push(projectile.id);
+            spacetimedb::log::info!("Projectile {} target no longer exists", projectile.id);
+        }
+    }
+    
+    // Clean up expired/hit projectiles
+    for projectile_id in projectiles_to_delete {
+        ctx.db.projectile().id().delete(projectile_id);
+    }
 }

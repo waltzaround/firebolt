@@ -30,18 +30,20 @@
  * - Socket handlers for network communication
  */
 
-import React, { useRef } from 'react';
-import { Canvas } from '@react-three/fiber';
+import React, { useRef, useEffect } from 'react';
+import { Canvas, useFrame } from '@react-three/fiber';
 import { Box, Plane, Grid, Sky } from '@react-three/drei';
 import * as THREE from 'three';
 import { DirectionalLightHelper, CameraHelper } from 'three'; // Import the helper
 // Import generated types
-import { PlayerData, InputState } from '../generated';
+import { PlayerData, ProjectileData, InputState } from '../generated';
 import { Identity } from '@clockworklabs/spacetimedb-sdk';
 import { Player } from './Player';
+import { FireBall } from '../shaders/FireShader';
 
 interface GameSceneProps {
   players: ReadonlyMap<string, PlayerData>; // Receive the map
+  projectiles: ReadonlyMap<number, ProjectileData>; // Receive projectiles map
   localPlayerIdentity: Identity | null;
   onPlayerRotation?: (rotation: THREE.Euler) => void; // Optional callback for player rotation
   currentInputRef?: React.MutableRefObject<InputState>; // Add input state ref prop
@@ -50,13 +52,17 @@ interface GameSceneProps {
 
 export const GameScene: React.FC<GameSceneProps> = ({ 
   players, 
+  projectiles,
   localPlayerIdentity,
   onPlayerRotation,
   currentInputRef, // Receive input state ref
   isDebugPanelVisible = false // Destructure the new prop
 }) => {
   // Ref for the main directional light
-  const directionalLightRef = useRef<THREE.DirectionalLight>(null!); 
+  const directionalLightRef = useRef<THREE.DirectionalLight>(null!);
+  
+  // Debug logging for projectiles
+  // console.log("🎯 GameScene render - projectiles count:", projectiles.size, Array.from(projectiles.values())); 
 
   return (
     <Canvas 
@@ -108,7 +114,7 @@ export const GameScene: React.FC<GameSceneProps> = ({
       >
         <meshStandardMaterial color="#606060" /> { /* Changed to darker gray */ }
       </Plane>
-o
+
       {/* Simplified Grid Helper (mid-gray lines) */}
       <Grid 
         position={[0, 0, 0]} 
@@ -134,7 +140,148 @@ o
         );
       })}
 
+      {/* Render Projectiles */}
+      {Array.from(projectiles.values()).map((projectile) => (
+        <SmoothProjectile 
+          key={projectile.id}
+          projectile={projectile}
+          players={players}
+        />
+      ))}
+
       {/* Remove OrbitControls as we're using our own camera controls */}
     </Canvas>
   );
 };
+
+// Smooth projectile component with homing but dodgable behavior
+function SmoothProjectile({ projectile, players }: { projectile: ProjectileData, players: ReadonlyMap<string, PlayerData> }) {
+  const meshRef = useRef<THREE.Mesh>(null);
+  const currentPosition = useRef(new THREE.Vector3(projectile.position.x, projectile.position.y, projectile.position.z));
+  const velocity = useRef(new THREE.Vector3(0, 0, 0));
+  const lastUpdateTime = useRef(Date.now());
+
+  // Initialize position
+  useEffect(() => {
+    currentPosition.current.set(projectile.position.x, projectile.position.y, projectile.position.z);
+  }, []);
+
+  // Find target player for homing (use correct camelCase field names)
+  const targetIdentity = (projectile as any).targetIdentity || projectile.target_identity;
+  let targetPlayer = targetIdentity ? players.get(targetIdentity.toString()) : null;
+  
+  // Fallback: if no targetIdentity, find nearest player (excluding caster)
+  if (!targetPlayer && players.size > 1) {
+    let nearestPlayer = null;
+    let nearestDistance = Infinity;
+    
+    for (const [playerId, player] of players) {
+      // Skip if this is the caster (use correct camelCase field names)
+      const casterIdentity = (projectile as any).casterIdentity || projectile.caster_identity;
+      if (casterIdentity && playerId === casterIdentity.toString()) {
+        continue;
+      }
+      
+      // Calculate distance from projectile to this player
+      const dx = player.position.x - projectile.position.x;
+      const dy = player.position.y - projectile.position.y;
+      const dz = player.position.z - projectile.position.z;
+      const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestPlayer = player;
+      }
+    }
+    
+    targetPlayer = nearestPlayer;
+    if (targetPlayer) {
+      console.log('🎯 Fallback targeting: Found nearest player at distance', nearestDistance.toFixed(2));
+    }
+  }
+  
+  // Debug logging for targeting (reduced to avoid spam)
+  if (Math.random() < 0.1) { // Only log 10% of the time to reduce spam
+    console.log('🎯 Projectile targeting debug:');
+    console.log('  - Projectile ID:', projectile.id);
+    console.log('  - Target identity (camelCase):', (projectile as any).targetIdentity);
+    console.log('  - Target identity (snake_case):', projectile.target_identity);
+    console.log('  - Final targetIdentity used:', targetIdentity);
+    console.log('  - Target player found:', !!targetPlayer);
+    console.log('  - Players count:', players.size);
+  }
+
+  useFrame((state, delta) => {
+    if (!meshRef.current) return;
+
+    const speed = projectile.speed || 15.0;
+    const homingStrength = 0.3; // Lower = more dodgable, higher = more aggressive homing
+    const maxTurnRate = 2.0; // Maximum turn rate per second (radians)
+
+    if (targetPlayer) {
+      // Homing behavior - gradually turn toward target
+      const targetPos = new THREE.Vector3(targetPlayer.position.x, targetPlayer.position.y, targetPlayer.position.z);
+      const toTarget = targetPos.clone().sub(currentPosition.current).normalize();
+      
+      // If velocity is zero, initialize it toward target
+      if (velocity.current.length() === 0) {
+        velocity.current.copy(toTarget).multiplyScalar(speed);
+      } else {
+        // Gradually turn velocity toward target (makes it dodgable)
+        const currentDir = velocity.current.clone().normalize();
+        const angle = currentDir.angleTo(toTarget);
+        const maxAngleThisFrame = maxTurnRate * delta;
+        
+        if (angle > maxAngleThisFrame) {
+          // Limit turning rate - this makes projectiles dodgable
+          const axis = new THREE.Vector3().crossVectors(currentDir, toTarget).normalize();
+          const quaternion = new THREE.Quaternion().setFromAxisAngle(axis, maxAngleThisFrame);
+          currentDir.applyQuaternion(quaternion);
+          velocity.current.copy(currentDir).multiplyScalar(speed);
+        } else {
+          // Can turn directly toward target
+          velocity.current.copy(toTarget).multiplyScalar(speed);
+        }
+      }
+    } else {
+      // No target - move in straight line
+      if (velocity.current.length() === 0) {
+        velocity.current.set(0, 0, speed); // Default forward direction
+      }
+    }
+
+    // Update position based on velocity
+    const movement = velocity.current.clone().multiplyScalar(delta);
+    currentPosition.current.add(movement);
+    
+    // Apply position to mesh
+    meshRef.current.position.copy(currentPosition.current);
+  });
+
+  // Check if this is a fireball projectile
+  const isFireball = projectile.projectile_type === 'homing_sphere';
+  
+  if (isFireball) {
+    return (
+      <group ref={meshRef}>
+        <FireBall 
+          position={[0, 0, 0]} 
+          scale={1.2} 
+          intensity={1.0} 
+        />
+      </group>
+    );
+  }
+
+  // Default projectile rendering for non-fireball types
+  return (
+    <mesh ref={meshRef} castShadow>
+      <sphereGeometry args={[0.3, 16, 16]} />
+      <meshStandardMaterial 
+        color={'#ffffff'}
+        emissive={'#000000'}
+        emissiveIntensity={0.5}
+      />
+    </mesh>
+  );
+}
