@@ -64,6 +64,8 @@ pub struct PlayerData {
     last_input_seq: u32,
     input: InputState,
     color: String,
+    vertical_velocity: f32,
+    is_grounded: bool,
 }
 
 #[spacetimedb::table(name = logged_out_player)]
@@ -194,6 +196,7 @@ pub fn register_player(ctx: &ReducerContext, username: String, character_class: 
         let default_input = InputState {
             forward: false, backward: false, left: false, right: false,
             sprint: false, jump: false, attack: false, cast_spell: false,
+            dash: false,
             sequence: 0
         };
         let rejoining_player = PlayerData {
@@ -214,6 +217,8 @@ pub fn register_player(ctx: &ReducerContext, username: String, character_class: 
             last_input_seq: 0,
             input: default_input,
             color: assigned_color,
+            vertical_velocity: 0.0,
+            is_grounded: true,
         };
         ctx.db.player().insert(rejoining_player);
         ctx.db.logged_out_player().identity().delete(player_identity);
@@ -222,6 +227,7 @@ pub fn register_player(ctx: &ReducerContext, username: String, character_class: 
         let default_input = InputState {
             forward: false, backward: false, left: false, right: false,
             sprint: false, jump: false, attack: false, cast_spell: false,
+            dash: false,
             sequence: 0
         };
         ctx.db.player().insert(PlayerData {
@@ -242,6 +248,8 @@ pub fn register_player(ctx: &ReducerContext, username: String, character_class: 
             last_input_seq: 0,
             input: default_input,
             color: assigned_color,
+            vertical_velocity: 0.0,
+            is_grounded: true,
         });
     }
 }
@@ -293,7 +301,7 @@ pub fn cast_spell(
         
         let current_time = ctx.timestamp;
         let expires_at = Timestamp::from_micros_since_unix_epoch(
-            current_time.to_micros_since_unix_epoch() + 5_000_000 // 5 seconds
+            current_time.to_micros_since_unix_epoch() + 60_000_000 // 60 seconds
         );
         
         // Create homing sphere - if target found, target them; otherwise create a projectile that moves forward
@@ -360,10 +368,21 @@ fn update_projectiles(ctx: &ReducerContext, delta_time: f64) {
     let mut projectiles_to_delete = Vec::new();
     
     for projectile in ctx.db.projectile().iter() {
+        // Debug: Log projectile lifetime info
+        let time_alive = (current_time.to_micros_since_unix_epoch() - projectile.created_at.to_micros_since_unix_epoch()) as f64 / 1_000_000.0;
+        let time_remaining = (projectile.expires_at.to_micros_since_unix_epoch() - current_time.to_micros_since_unix_epoch()) as f64 / 1_000_000.0;
+        
+        spacetimedb::log::info!(
+            "🚀 Projectile {} - Alive: {:.1}s, Remaining: {:.1}s", 
+            projectile.id, 
+            time_alive, 
+            time_remaining
+        );
+        
         // Check if projectile has expired
         if current_time.to_micros_since_unix_epoch() >= projectile.expires_at.to_micros_since_unix_epoch() {
             projectiles_to_delete.push(projectile.id);
-            spacetimedb::log::info!("Projectile {} expired", projectile.id);
+            spacetimedb::log::info!("⏰ Projectile {} EXPIRED after {:.1}s", projectile.id, time_alive);
             continue;
         }
         
@@ -382,10 +401,26 @@ fn update_projectiles(ctx: &ReducerContext, delta_time: f64) {
             // Check if projectile reached target (within 1 unit)
             if distance <= 1.0 {
                 projectiles_to_delete.push(projectile.id);
-                spacetimedb::log::info!("Projectile {} hit target {}", projectile.id, target.identity);
+                spacetimedb::log::info!("🎯 Projectile {} HIT target {} at distance {:.2}", projectile.id, target.identity, distance);
                 
-                // TODO: Apply damage or effect to target here
-                // For now, just log the hit
+                // Apply 10hp damage to target (prevent self-damage)
+                if target.identity != projectile.caster_identity {
+                    let new_health = (target.health - 10).max(0);
+                    let mut updated_target = target.clone();
+                    updated_target.health = new_health;
+                    ctx.db.player().identity().update(updated_target);
+                    
+                    spacetimedb::log::info!(
+                        "Projectile {} dealt 10 damage to player {} (health: {} -> {})", 
+                        projectile.id, 
+                        target.identity, 
+                        target.health, 
+                        new_health
+                    );
+                } else {
+                    spacetimedb::log::info!("Projectile {} hit caster {} - no self-damage", projectile.id, target.identity);
+                }
+                
                 continue;
             }
             
@@ -414,7 +449,7 @@ fn update_projectiles(ctx: &ReducerContext, delta_time: f64) {
         } else {
             // Target player no longer exists, remove projectile
             projectiles_to_delete.push(projectile.id);
-            spacetimedb::log::info!("Projectile {} target no longer exists", projectile.id);
+            spacetimedb::log::info!("👻 Projectile {} TARGET NO LONGER EXISTS (target_identity: {})", projectile.id, projectile.target_identity);
         }
     }
     
